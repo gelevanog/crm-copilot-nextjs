@@ -10,6 +10,10 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
+https://github.com/user-attachments/assets/1ec86b3d-7449-421c-ac5d-4af8d365007f
+
+<sub>43-second walkthrough with voiceover. Can't play it? [Download the MP4](docs/demo.mp4).</sub>
+
 ![Copilot drawer answering a pipeline question with a searchDeals tool call](docs/copilot-chat.png)
 
 ## What problem it solves
