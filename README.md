@@ -9,6 +9,8 @@
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
+![Copilot drawer answering a pipeline question with a searchDeals tool call](docs/copilot-chat.png)
+
 ## What problem it solves
 
 Most companies asking for "AI in our product" already have a product: a database, user accounts, permissions and screens their customers rely on. A separate chatbot that is pasted on top and "knows" things it should not is a liability.
@@ -41,6 +43,8 @@ This project shows the other approach, on a realistic example (a sales CRM):
 
 - A search box on the Deals page turns text ("my open deals over 25k closing this month") into a **validated `DealFilter` object**.
 - The filter is applied through the **normal query-string filters and list UI** (chips you can remove one by one, table and board views). The LLM only fills in a form; the existing query layer does the rest.
+
+![Natural-language filter applied to the Deals list](docs/nl-filter.png)
 
 ### Safety and operations
 
