@@ -2,6 +2,7 @@
 
 **Adding LLM features to an existing SaaS app, done safely: a small multi-tenant CRM with a tool-calling copilot, structured-output smart actions and natural-language filters, all running on the app's own data model and permissions.**
 
+[![CI](https://github.com/gelevanog/crm-copilot-nextjs/actions/workflows/ci.yml/badge.svg)](https://github.com/gelevanog/crm-copilot-nextjs/actions/workflows/ci.yml)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![NestJS](https://img.shields.io/badge/NestJS-11-E0234E?logo=nestjs&logoColor=white)
@@ -444,7 +445,7 @@ pnpm build       # shared + API + web production builds
 - **Rate limiter**: burst, refill, per-workspace buckets (fake clock).
 - **E2E** (Nest app + supertest + Postgres): auth, validation, streamed NDJSON chat with usage row, NL filter feeding `GET /deals`, follow-up email, cross-tenant 404, `429` with `Retry-After`, usage report.
 
-DB-backed suites use `TEST_DATABASE_URL` (default: the `crm_test` database created by `docker compose up db`) and are skipped with a warning when Postgres is not reachable. CI (`.gitlab-ci.yml`) runs lint, format check, typecheck, tests with a Postgres service, builds, and Docker image builds on the default branch.
+DB-backed suites use `TEST_DATABASE_URL` (default: the `crm_test` database created by `docker compose up db`) and are skipped with a warning when Postgres is not reachable. CI (`.github/workflows/ci.yml`, GitHub Actions) runs lint, format check, typecheck, tests with a Postgres service, builds, and Docker image builds on the default branch.
 
 ## Roadmap
 
