@@ -1,0 +1,53 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+
+  --color-background: oklch(0.985 0.002 260);
+  --color-foreground: oklch(0.2 0.02 265);
+  --color-card: oklch(1 0 0);
+  --color-muted: oklch(0.965 0.004 265);
+  --color-muted-foreground: oklch(0.52 0.02 265);
+  --color-border: oklch(0.92 0.005 265);
+  --color-ring: oklch(0.62 0.19 285);
+
+  --color-primary: oklch(0.22 0.02 265);
+  --color-primary-foreground: oklch(0.98 0 0);
+
+  /* AI accent: used only for copilot features so they are easy to spot. */
+  --color-ai: oklch(0.55 0.22 285);
+  --color-ai-foreground: oklch(0.99 0 0);
+  --color-ai-soft: oklch(0.965 0.025 285);
+  --color-ai-border: oklch(0.88 0.06 285);
+
+  --color-danger: oklch(0.58 0.2 25);
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  * {
+    @apply border-border;
+  }
+  :focus-visible {
+    @apply ring-ring/40 outline-none ring-2;
+  }
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+.caret::after {
+  content: '▍';
+  margin-left: 1px;
+  animation: blink 1s step-start infinite;
+  color: var(--color-ai);
+}

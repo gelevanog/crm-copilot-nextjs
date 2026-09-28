@@ -1,0 +1,239 @@
+import OpenAI from 'openai';
+import type {
+  ChatCompletionChunk,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from 'openai/resources/chat/completions';
+import { toJsonSchema } from './json-schema';
+import { LlmError } from './llm-error';
+import type {
+  ConversationItem,
+  LlmProvider,
+  StopReason,
+  StructuredRequest,
+  StructuredResult,
+  TokenUsage,
+  ToolCall,
+  TurnRequest,
+  TurnResult,
+} from './llm.types';
+import { ZERO_USAGE } from './llm.types';
+
+export interface OpenAiProviderOptions {
+  apiKey: string;
+  model: string;
+  baseURL?: string;
+  maxOutputTokens: number;
+  timeoutMs: number;
+  /** Custom fetch (used by tests to replay recorded HTTP streams). */
+  fetch?: typeof fetch;
+}
+
+export class OpenAiProvider implements LlmProvider {
+  readonly name = 'openai' as const;
+  readonly model: string;
+  private readonly client: OpenAI;
+
+  constructor(private readonly opts: OpenAiProviderOptions) {
+    this.model = opts.model;
+    this.client = new OpenAI({
+      apiKey: opts.apiKey,
+      baseURL: opts.baseURL,
+      timeout: opts.timeoutMs,
+      maxRetries: 2,
+      ...(opts.fetch && { fetch: opts.fetch }),
+    });
+  }
+
+  async runTurn(req: TurnRequest): Promise<TurnResult> {
+    const tools: ChatCompletionTool[] = req.tools.map((t) => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.inputSchema },
+    }));
+
+    try {
+      const stream = await this.client.chat.completions.create(
+        {
+          model: this.model,
+          messages: toOpenAiMessages(req.system, req.items),
+          tools,
+          tool_choice: 'auto',
+          max_completion_tokens: this.opts.maxOutputTokens,
+          stream: true,
+          stream_options: { include_usage: true },
+        },
+        { signal: req.signal },
+      );
+
+      let text = '';
+      let finishReason: ChatCompletionChunk.Choice['finish_reason'] = null;
+      let usage: TokenUsage = ZERO_USAGE;
+      // Tool call arguments arrive as JSON fragments keyed by index.
+      const partialCalls = new Map<number, { id: string; name: string; args: string }>();
+
+      for await (const chunk of stream) {
+        if (chunk.usage) {
+          usage = {
+            inputTokens:
+              chunk.usage.prompt_tokens - (chunk.usage.prompt_tokens_details?.cached_tokens ?? 0),
+            outputTokens: chunk.usage.completion_tokens,
+            cacheReadTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? 0,
+            cacheWriteTokens: 0,
+          };
+        }
+        const choice = chunk.choices[0];
+        if (!choice) continue;
+        if (choice.delta.content) {
+          text += choice.delta.content;
+          req.onTextDelta(choice.delta.content);
+        }
+        for (const delta of choice.delta.tool_calls ?? []) {
+          const entry = partialCalls.get(delta.index) ?? { id: '', name: '', args: '' };
+          if (delta.id) entry.id = delta.id;
+          if (delta.function?.name) entry.name += delta.function.name;
+          if (delta.function?.arguments) entry.args += delta.function.arguments;
+          partialCalls.set(delta.index, entry);
+        }
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+      }
+
+      const toolCalls: ToolCall[] = [...partialCalls.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([, c]) => ({ id: c.id, name: c.name, input: parseArguments(c.args) }));
+
+      return { text, toolCalls, stopReason: mapFinishReason(finishReason), usage };
+    } catch (err) {
+      throw mapOpenAiError(err);
+    }
+  }
+
+  async generateStructured<T>(req: StructuredRequest<T>): Promise<StructuredResult> {
+    try {
+      const completion = await this.client.chat.completions.create(
+        {
+          model: this.model,
+          messages: [
+            { role: 'system', content: req.prompt.system },
+            { role: 'user', content: req.prompt.user },
+          ],
+          max_completion_tokens: this.opts.maxOutputTokens,
+          // `strict: false` because our schemas use optional fields, which strict
+          // mode does not allow. The Zod schema is the real guarantee: the caller
+          // validates the result before using it.
+          response_format: {
+            type: 'json_schema',
+            json_schema: { name: req.schemaName, schema: toJsonSchema(req.schema), strict: false },
+          },
+        },
+        { signal: req.signal },
+      );
+      const choice = completion.choices[0];
+      if (choice?.message.refusal) {
+        throw new LlmError('model_refused', choice.message.refusal);
+      }
+      if (choice?.finish_reason === 'length') {
+        throw new LlmError('output_truncated', 'OpenAI structured output hit the token limit');
+      }
+      const content = choice?.message.content ?? '';
+      let value: unknown;
+      try {
+        value = JSON.parse(content);
+      } catch (err) {
+        throw new LlmError('invalid_model_output', 'OpenAI returned non-JSON content', {
+          cause: err,
+        });
+      }
+      const u = completion.usage;
+      return {
+        value,
+        usage: u
+          ? {
+              inputTokens: u.prompt_tokens - (u.prompt_tokens_details?.cached_tokens ?? 0),
+              outputTokens: u.completion_tokens,
+              cacheReadTokens: u.prompt_tokens_details?.cached_tokens ?? 0,
+              cacheWriteTokens: 0,
+            }
+          : ZERO_USAGE,
+      };
+    } catch (err) {
+      throw mapOpenAiError(err);
+    }
+  }
+}
+
+function toOpenAiMessages(system: string, items: ConversationItem[]): ChatCompletionMessageParam[] {
+  const messages: ChatCompletionMessageParam[] = [{ role: 'system', content: system }];
+  for (const item of items) {
+    switch (item.role) {
+      case 'user':
+        messages.push({ role: 'user', content: item.text });
+        break;
+      case 'assistant':
+        messages.push({
+          role: 'assistant',
+          content: item.text || null,
+          ...(item.toolCalls.length > 0 && {
+            tool_calls: item.toolCalls.map((c) => ({
+              id: c.id,
+              type: 'function' as const,
+              function: { name: c.name, arguments: JSON.stringify(c.input) },
+            })),
+          }),
+        });
+        break;
+      case 'tool_results':
+        for (const r of item.results) {
+          messages.push({ role: 'tool', tool_call_id: r.toolCallId, content: r.content });
+        }
+        break;
+    }
+  }
+  return messages;
+}
+
+/** Invalid JSON is passed through as a marker; Zod validation then reports it to the model. */
+function parseArguments(raw: string): unknown {
+  if (raw.trim() === '') return {};
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return { __invalid_json__: raw };
+  }
+}
+
+function mapFinishReason(reason: ChatCompletionChunk.Choice['finish_reason']): StopReason {
+  switch (reason) {
+    case 'stop':
+      return 'end_turn';
+    case 'tool_calls':
+    case 'function_call':
+      return 'tool_use';
+    case 'length':
+      return 'max_tokens';
+    case 'content_filter':
+      return 'refusal';
+    default:
+      return 'other';
+  }
+}
+
+function mapOpenAiError(err: unknown): LlmError {
+  if (err instanceof LlmError) return err;
+  if (err instanceof OpenAI.APIUserAbortError)
+    return new LlmError('aborted', 'Request aborted', { cause: err });
+  if (err instanceof OpenAI.AuthenticationError || err instanceof OpenAI.PermissionDeniedError) {
+    return new LlmError('provider_auth', err.message, { cause: err });
+  }
+  if (err instanceof OpenAI.RateLimitError) {
+    return new LlmError('provider_rate_limited', err.message, { cause: err });
+  }
+  if (err instanceof OpenAI.BadRequestError || err instanceof OpenAI.NotFoundError) {
+    return new LlmError('provider_bad_request', err.message, { cause: err });
+  }
+  if (err instanceof OpenAI.APIError) {
+    return new LlmError('provider_unavailable', err.message, { cause: err });
+  }
+  return new LlmError('provider_unavailable', err instanceof Error ? err.message : String(err), {
+    cause: err,
+  });
+}

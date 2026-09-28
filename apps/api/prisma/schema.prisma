@@ -1,0 +1,171 @@
+// CRM data model. Every business table carries `workspaceId`; the API always
+// filters on it, and the AI tools reuse the same services, so the model can
+// never reach another tenant's rows.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DealStage {
+  LEAD
+  QUALIFIED
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum ActivityType {
+  NOTE
+  CALL
+  EMAIL
+  MEETING
+  TASK
+}
+
+enum AiFeature {
+  chat
+  follow_up_email
+  notes_summary
+  nl_filter
+}
+
+model Workspace {
+  id         String     @id @default(cuid())
+  name       String
+  slug       String     @unique
+  createdAt  DateTime   @default(now())
+  users      User[]
+  companies  Company[]
+  contacts   Contact[]
+  deals      Deal[]
+  activities Activity[]
+  aiUsage    AiUsage[]
+}
+
+model User {
+  id           String     @id @default(cuid())
+  workspaceId  String
+  workspace    Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email        String     @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime   @default(now())
+  deals        Deal[]
+  activities   Activity[]
+  aiUsage      AiUsage[]
+
+  @@index([workspaceId])
+}
+
+model Company {
+  id          String     @id @default(cuid())
+  workspaceId String
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  domain      String?
+  industry    String?
+  employees   Int?
+  city        String?
+  country     String?
+  createdAt   DateTime   @default(now())
+  contacts    Contact[]
+  deals       Deal[]
+  activities  Activity[]
+
+  @@unique([workspaceId, name])
+  @@index([workspaceId])
+}
+
+model Contact {
+  id          String     @id @default(cuid())
+  workspaceId String
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  companyId   String
+  company     Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  firstName   String
+  lastName    String
+  email       String
+  title       String?
+  phone       String?
+  createdAt   DateTime   @default(now())
+  deals       Deal[]
+  activities  Activity[]
+
+  @@index([workspaceId, companyId])
+}
+
+model Deal {
+  id                String     @id @default(cuid())
+  workspaceId       String
+  workspace         Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  companyId         String
+  company           Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contactId         String?
+  contact           Contact?   @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  ownerId           String
+  owner             User       @relation(fields: [ownerId], references: [id])
+  title             String
+  /// Whole US dollars.
+  amount            Int
+  stage             DealStage
+  stageChangedAt    DateTime
+  expectedCloseDate DateTime?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  activities        Activity[]
+
+  @@index([workspaceId, stage])
+  @@index([workspaceId, companyId])
+}
+
+model Activity {
+  id          String       @id @default(cuid())
+  workspaceId String
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  type        ActivityType
+  subject     String
+  body        String?
+  occurredAt  DateTime
+  authorId    String
+  author      User         @relation(fields: [authorId], references: [id])
+  companyId   String?
+  company     Company?     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contactId   String?
+  contact     Contact?     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  dealId      String?
+  deal        Deal?        @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  createdAt   DateTime     @default(now())
+
+  @@index([workspaceId, occurredAt])
+  @@index([workspaceId, companyId])
+  @@index([workspaceId, dealId])
+}
+
+/// One row per LLM-backed request: tokens, estimated cost, latency, outcome.
+model AiUsage {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  workspace    Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  feature      AiFeature
+  provider     String
+  model        String
+  inputTokens  Int
+  outputTokens Int
+  costUsd      Decimal   @db.Decimal(12, 6)
+  latencyMs    Int
+  toolCalls    Int       @default(0)
+  success      Boolean
+  errorCode    String?
+  createdAt    DateTime  @default(now())
+
+  @@index([workspaceId, createdAt])
+}

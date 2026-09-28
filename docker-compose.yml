@@ -1,0 +1,58 @@
+# Zero-key demo:   docker compose up --build
+# Real models:     LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=... docker compose up --build
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm
+      POSTGRES_DB: crm
+    ports:
+      - '${DB_PORT:-5433}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U crm -d crm']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://crm:crm@db:5432/crm?schema=public
+      JWT_SECRET: ${JWT_SECRET:-demo-only-secret-change-me-in-production}
+      CORS_ORIGIN: http://localhost:${WEB_PORT:-3000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SEED_ON_START: 'true'
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      AI_RATE_LIMIT_CAPACITY: ${AI_RATE_LIMIT_CAPACITY:-20}
+      AI_RATE_LIMIT_REFILL_PER_MINUTE: ${AI_RATE_LIMIT_REFILL_PER_MINUTE:-10}
+    ports:
+      - '${API_PORT:-4000}:4000'
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      API_URL: http://api:4000
+    ports:
+      - '${WEB_PORT:-3000}:3000'
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
