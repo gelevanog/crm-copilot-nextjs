@@ -6,7 +6,12 @@ import {
   type NotesSummary,
   type PipelineStats,
 } from '@crm/shared';
-import type { GetCompanyData, ListActivitiesData, SearchDealsData } from '../../tools/crm-tools';
+import type {
+  GetCompanyData,
+  ListActivitiesData,
+  ProposalToolData,
+  SearchDealsData,
+} from '../../tools/crm-tools';
 import type { FollowUpContext, NotesSummaryContext } from '../../prompts/templates';
 
 /* Deterministic, template-based writers used by the fake provider. */
@@ -79,6 +84,54 @@ export function answerPipeline(stats: PipelineStats): string {
   ].join('\n');
 }
 
+export function answerProposals(proposals: ProposalToolData[], now = new Date()): string {
+  const lines = proposals.map((p) => {
+    const diff = p.changes
+      .map((c) =>
+        c.before === null ? `${c.field}: ${c.after}` : `${c.field}: ${c.before} → ${c.after}`,
+      )
+      .join('; ');
+    return `- **${p.title}**: ${p.target} (${diff})`;
+  });
+  const minutes = Math.max(
+    1,
+    Math.round(
+      (Math.min(...proposals.map((p) => Date.parse(p.expiresAt))) - now.getTime()) / 60_000,
+    ),
+  );
+  const intro =
+    proposals.length === 1
+      ? "I've prepared this change for your approval:"
+      : "I've prepared these changes for your approval:";
+  return `${intro}\n\n${lines.join('\n')}\n\nNothing has been changed yet. Approve or reject it on the card above; it expires in ${minutes} minutes.`;
+}
+
+export function answerFromNote(note: string): string {
+  return `Here is the latest update from the app: ${note}`;
+}
+
+interface ToolErrorData {
+  error?: string;
+  message?: string;
+  candidates?: (
+    { title: string; company: string; stage: keyof typeof DEAL_STAGE_LABELS } | string
+  )[];
+}
+
+export function describeToolError(data: ToolErrorData): string {
+  if (data.error === 'ambiguous' && data.candidates?.length) {
+    const lines = data.candidates.map((c) =>
+      typeof c === 'string' ? `- ${c}` : `- **${c.title}** (${c.company}, ${stage(c.stage)})`,
+    );
+    return `That matches more than one record:\n\n${lines.join('\n')}\n\nWhich one do you mean?`;
+  }
+  if (data.error === 'no_change' && data.message)
+    return `${data.message} There is nothing to change.`;
+  return data.message
+    ? `${data.message} Please check the name and try again.`
+    : 'I could not look that up. Please rephrase and try again.';
+}
+
 export const HELP_ANSWER = [
   'I can answer questions about your CRM data. Try for example:',
   '',
@@ -86,6 +139,7 @@ export const HELP_ANSWER = [
   '- "Summarize my last interactions with Acme"',
   '- "How is the pipeline looking?"',
   '- "Show my deals closing this month"',
+  '- "Move the Acme deal to Proposal" (you approve the change before it is applied)',
 ].join('\n');
 
 function firstSentence(text: string): string {

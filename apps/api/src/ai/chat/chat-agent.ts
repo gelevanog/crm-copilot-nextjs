@@ -1,4 +1,5 @@
-import type { ChatMessage, ChatStreamEvent } from '@crm/shared';
+import type { ChatStreamEvent } from '@crm/shared';
+import type { StoredToolResult, TranscriptEntry } from '../conversations/transcript';
 import { LlmError } from '../llm/llm-error';
 import {
   addUsage,
@@ -6,7 +7,6 @@ import {
   type ConversationItem,
   type LlmProvider,
   type TokenUsage,
-  type ToolResultItem,
 } from '../llm/llm.types';
 import { chatSystemPrompt } from '../prompts/templates';
 import type { CrmToolsService, ToolContext } from '../tools/crm-tools';
@@ -17,15 +17,26 @@ const MAX_TOOL_RESULT_CHARS = 12_000;
 export interface ChatRunInput {
   ctx: ToolContext;
   userName: string;
-  messages: ChatMessage[];
+  /** Conversation so far, ending with the user's new question. */
+  history: ConversationItem[];
   signal?: AbortSignal;
   now?: Date;
 }
+
+/**
+ * Receives each completed step for persistence: an assistant turn together
+ * with all of its tool results, or the final answer. A step is only recorded
+ * once it is complete, so a saved transcript never ends with a tool call that
+ * has no result.
+ */
+export type RecordEntry = (entry: TranscriptEntry) => void;
 
 export interface ChatRunResult {
   usage: TokenUsage;
   toolCalls: number;
   iterations: number;
+  /** Model that answered the last turn, if the provider reports one (router fallbacks). */
+  servedModel?: string;
 }
 
 /**
@@ -41,20 +52,21 @@ export class ChatAgent {
     private readonly maxIterations: number,
   ) {}
 
-  async run(input: ChatRunInput, emit: (event: ChatStreamEvent) => void): Promise<ChatRunResult> {
+  async run(
+    input: ChatRunInput,
+    emit: (event: ChatStreamEvent) => void,
+    record: RecordEntry = () => undefined,
+  ): Promise<ChatRunResult> {
     const system = chatSystemPrompt({
       userName: input.userName,
       today: (input.now ?? new Date()).toISOString().slice(0, 10),
     });
     const specs = this.tools.specs();
-    const items: ConversationItem[] = input.messages.map((m) =>
-      m.role === 'user'
-        ? { role: 'user', text: m.content }
-        : { role: 'assistant', text: m.content, toolCalls: [] },
-    );
+    const items: ConversationItem[] = [...input.history];
 
     let usage = ZERO_USAGE;
     let toolCalls = 0;
+    let servedModel: string | undefined;
 
     for (let iteration = 1; iteration <= this.maxIterations; iteration++) {
       const turn = await this.provider.runTurn({
@@ -65,12 +77,14 @@ export class ChatAgent {
         onTextDelta: (delta) => emit({ type: 'text', delta }),
       });
       usage = addUsage(usage, turn.usage);
+      servedModel = turn.servedModel ?? servedModel;
 
       if (turn.stopReason === 'refusal') {
         throw new LlmError('model_refused', 'Model refused the chat request');
       }
       if (turn.toolCalls.length === 0) {
-        return { usage, toolCalls, iterations: iteration };
+        record({ role: 'assistant', text: turn.text, toolCalls: [] });
+        return { usage, toolCalls, iterations: iteration, servedModel };
       }
       if (turn.stopReason === 'max_tokens') {
         // A tool call cut off mid-arguments may still parse; never run it.
@@ -87,7 +101,7 @@ export class ChatAgent {
       // Execute all calls of this turn in parallel and return every result in
       // one message, as both vendor APIs expect.
       const results = await Promise.all(
-        turn.toolCalls.map(async (call): Promise<ToolResultItem> => {
+        turn.toolCalls.map(async (call): Promise<StoredToolResult> => {
           emit({ type: 'tool_call', id: call.id, name: call.name, input: call.input });
           const outcome = await this.tools.execute(input.ctx, call.name, call.input);
           emit({
@@ -97,25 +111,30 @@ export class ChatAgent {
             ok: outcome.ok,
             summary: outcome.summary,
             ...(outcome.table && { table: outcome.table }),
+            ...(outcome.proposal && { proposal: outcome.proposal }),
           });
           return {
             toolCallId: call.id,
             name: call.name,
             content: truncateJson(outcome.data),
             isError: !outcome.ok,
+            summary: outcome.summary,
+            ...(outcome.table && { table: outcome.table }),
+            ...(outcome.proposal && { proposalId: outcome.proposal.id }),
           };
         }),
       );
       toolCalls += results.length;
       items.push({ role: 'tool_results', results });
+      record({ role: 'assistant', text: turn.text, toolCalls: turn.toolCalls });
+      record({ role: 'tool_results', results });
     }
 
-    emit({
-      type: 'text',
-      delta:
-        '\n\nI stopped after several lookups without reaching a final answer. Please narrow the question.',
-    });
-    return { usage, toolCalls, iterations: this.maxIterations };
+    const stopped =
+      'I stopped after several lookups without reaching a final answer. Please narrow the question.';
+    emit({ type: 'text', delta: `\n\n${stopped}` });
+    record({ role: 'assistant', text: stopped, toolCalls: [] });
+    return { usage, toolCalls, iterations: this.maxIterations, servedModel };
   }
 }
 

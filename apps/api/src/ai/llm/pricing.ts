@@ -29,6 +29,8 @@ export function priceFor(model: string, override: PriceOverride = {}): Price | n
   if (override.inputPerMTok !== undefined && override.outputPerMTok !== undefined) {
     return { input: override.inputPerMTok, output: override.outputPerMTok };
   }
+  // OpenRouter's free variants are suffixed ":free".
+  if (model.endsWith(':free')) return { input: 0, output: 0 };
   return PRICES[model] ?? null;
 }
 

@@ -1,5 +1,11 @@
 import type { DealFilter, PipelineStats } from '@crm/shared';
-import type { GetCompanyData, ListActivitiesData, SearchDealsData } from '../../tools/crm-tools';
+import { parseAppNote } from '../../prompts/templates';
+import type {
+  GetCompanyData,
+  ListActivitiesData,
+  ProposalToolData,
+  SearchDealsData,
+} from '../../tools/crm-tools';
 import type {
   ConversationItem,
   LlmProvider,
@@ -12,13 +18,17 @@ import type {
 } from '../llm.types';
 import {
   answerCompany,
+  answerFromNote,
   answerPipeline,
+  answerProposals,
   answerSearchDeals,
+  describeToolError,
   HELP_ANSWER,
   writeFollowUpEmail,
   writeNotesSummary,
 } from './fake-writers';
 import { extractCompanyName, parseDealFilterRules } from './rule-filter-parser';
+import { planWriteCall } from './write-intents';
 
 export interface FakeProviderOptions {
   /** Delay between streamed chunks, to make the demo feel like a real model. */
@@ -46,8 +56,16 @@ export class FakeProvider implements LlmProvider {
     let toolCalls: ToolCall[] = [];
 
     if (last?.role === 'user') {
-      toolCalls = planToolCalls(last.text).map((c, i) => ({ ...c, id: `call_${turnIndex}_${i}` }));
-      if (toolCalls.length === 0) text = HELP_ANSWER;
+      const note = asksForOutcome(last.text) ? latestAppNote(req.items) : undefined;
+      if (note) {
+        text = answerFromNote(note);
+      } else {
+        toolCalls = planToolCalls(last.text).map((c, i) => ({
+          ...c,
+          id: `call_${turnIndex}_${i}`,
+        }));
+        if (toolCalls.length === 0) text = HELP_ANSWER;
+      }
     } else if (last?.role === 'tool_results') {
       text = composeAnswer(req.items);
     }
@@ -98,6 +116,9 @@ type PlannedCall = Omit<ToolCall, 'id'>;
 
 /** Keyword router: which tools would a sensible model call for this question? */
 export function planToolCalls(question: string): PlannedCall[] {
+  const write = planWriteCall(question);
+  if (write) return [write];
+
   const q = question.toLowerCase();
   const company = extractCompanyName(question) ?? extractLowercaseCompany(q);
   const asksDeals =
@@ -132,6 +153,23 @@ export function planToolCalls(question: string): PlannedCall[] {
   return [];
 }
 
+/** "Did that go through?", "Was the change applied?" */
+function asksForOutcome(question: string): boolean {
+  return /\b(did|has|have|was|is)\b.*\b(go(ne)? through|applied|approved|rejected|done|happen(ed)?)\b/i.test(
+    question,
+  );
+}
+
+/** The most recent application note in the history (e.g. a proposal outcome). */
+function latestAppNote(items: ConversationItem[]): string | undefined {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    const note = item?.role === 'user' ? parseAppNote(item.text) : null;
+    if (note) return note;
+  }
+  return undefined;
+}
+
 function extractLowercaseCompany(q: string): string | undefined {
   const m = /\b(?:with|about|for|at)\s+([a-z][\w&.-]*(?:\s+[a-z][\w&.-]*)?)\s*[?.!]?$/.exec(
     q.trim(),
@@ -156,12 +194,12 @@ function composeAnswer(items: ConversationItem[]): string {
   }
 
   const failed = [...byName.values()].find((r) => r.isError);
-  if (failed) {
-    const message = (failed.data as { message?: string }).message;
-    return message
-      ? `${message} Please check the name and try again.`
-      : 'I could not look that up. Please rephrase and try again.';
-  }
+  if (failed) return describeToolError(failed.data as Parameters<typeof describeToolError>[0]);
+
+  const proposals = [...byName.entries()]
+    .filter(([name]) => name.startsWith('propose'))
+    .map(([, r]) => r.data as ProposalToolData);
+  if (proposals.length > 0) return answerProposals(proposals);
 
   const company = byName.get('getCompany');
   if (company) {

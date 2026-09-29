@@ -1,9 +1,12 @@
 import OpenAI from 'openai';
 import type {
   ChatCompletionChunk,
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from 'openai/resources/chat/completions';
+import { parseModelJson } from './json-output';
 import { toJsonSchema } from './json-schema';
 import { LlmError } from './llm-error';
 import type {
@@ -20,29 +23,58 @@ import type {
 import { ZERO_USAGE } from './llm.types';
 
 export interface OpenAiProviderOptions {
+  /** `openrouter` targets OpenRouter's OpenAI-compatible API (same wire format). */
+  name?: 'openai' | 'openrouter';
   apiKey: string;
   model: string;
   baseURL?: string;
   maxOutputTokens: number;
   timeoutMs: number;
+  /** SDK retries for rate limits and transient failures. */
+  maxRetries: number;
+  /** Sent with every request, e.g. OpenRouter's HTTP-Referer and X-Title attribution. */
+  defaultHeaders?: Record<string, string>;
+  /** OpenRouter only: models tried in order when the primary one fails or is rate limited. */
+  fallbackModels?: string[];
   /** Custom fetch (used by tests to replay recorded HTTP streams). */
   fetch?: typeof fetch;
 }
 
+/** OpenRouter extension of the Chat Completions body. */
+interface RouterParams {
+  models?: string[];
+}
+
+/**
+ * OpenAI Chat Completions adapter. Also serves OpenRouter, which speaks the
+ * same protocol and adds model fallbacks; there the response names the model
+ * that actually answered, which is reported as `servedModel`.
+ */
 export class OpenAiProvider implements LlmProvider {
-  readonly name = 'openai' as const;
+  readonly name: 'openai' | 'openrouter';
   readonly model: string;
   private readonly client: OpenAI;
+  private readonly routing: RouterParams;
 
   constructor(private readonly opts: OpenAiProviderOptions) {
+    this.name = opts.name ?? 'openai';
     this.model = opts.model;
+    this.routing = opts.fallbackModels?.length
+      ? { models: [opts.model, ...opts.fallbackModels] }
+      : {};
     this.client = new OpenAI({
       apiKey: opts.apiKey,
       baseURL: opts.baseURL,
       timeout: opts.timeoutMs,
-      maxRetries: 2,
+      maxRetries: opts.maxRetries,
+      ...(opts.defaultHeaders && { defaultHeaders: opts.defaultHeaders }),
       ...(opts.fetch && { fetch: opts.fetch }),
     });
+  }
+
+  /** Only a router can answer with a different model than the one requested. */
+  private served(model: string | undefined): string | undefined {
+    return this.name === 'openrouter' && model ? model : undefined;
   }
 
   async runTurn(req: TurnRequest): Promise<TurnResult> {
@@ -51,27 +83,28 @@ export class OpenAiProvider implements LlmProvider {
       function: { name: t.name, description: t.description, parameters: t.inputSchema },
     }));
 
+    const params: ChatCompletionCreateParamsStreaming & RouterParams = {
+      model: this.model,
+      messages: toOpenAiMessages(req.system, req.items),
+      tools,
+      tool_choice: 'auto',
+      max_completion_tokens: this.opts.maxOutputTokens,
+      stream: true,
+      stream_options: { include_usage: true },
+      ...this.routing,
+    };
     try {
-      const stream = await this.client.chat.completions.create(
-        {
-          model: this.model,
-          messages: toOpenAiMessages(req.system, req.items),
-          tools,
-          tool_choice: 'auto',
-          max_completion_tokens: this.opts.maxOutputTokens,
-          stream: true,
-          stream_options: { include_usage: true },
-        },
-        { signal: req.signal },
-      );
+      const stream = await this.client.chat.completions.create(params, { signal: req.signal });
 
       let text = '';
+      let servedModel: string | undefined;
       let finishReason: ChatCompletionChunk.Choice['finish_reason'] = null;
       let usage: TokenUsage = ZERO_USAGE;
       // Tool call arguments arrive as JSON fragments keyed by index.
       const partialCalls = new Map<number, { id: string; name: string; args: string }>();
 
       for await (const chunk of stream) {
+        if (chunk.model) servedModel = chunk.model;
         if (chunk.usage) {
           usage = {
             inputTokens:
@@ -101,32 +134,39 @@ export class OpenAiProvider implements LlmProvider {
         .sort(([a], [b]) => a - b)
         .map(([, c]) => ({ id: c.id, name: c.name, input: parseArguments(c.args) }));
 
-      return { text, toolCalls, stopReason: mapFinishReason(finishReason), usage };
+      return {
+        text,
+        toolCalls,
+        stopReason: mapFinishReason(finishReason),
+        usage,
+        ...(this.served(servedModel) && { servedModel }),
+      };
     } catch (err) {
       throw mapOpenAiError(err);
     }
   }
 
   async generateStructured<T>(req: StructuredRequest<T>): Promise<StructuredResult> {
+    const params: ChatCompletionCreateParamsNonStreaming & RouterParams = {
+      model: this.model,
+      messages: [
+        { role: 'system', content: req.prompt.system },
+        { role: 'user', content: req.prompt.user },
+      ],
+      max_completion_tokens: this.opts.maxOutputTokens,
+      // `strict: false` because our schemas use optional fields, which strict
+      // mode does not allow. The Zod schema is the real guarantee: the caller
+      // validates the result before using it.
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: req.schemaName, schema: toJsonSchema(req.schema), strict: false },
+      },
+      ...this.routing,
+    };
     try {
-      const completion = await this.client.chat.completions.create(
-        {
-          model: this.model,
-          messages: [
-            { role: 'system', content: req.prompt.system },
-            { role: 'user', content: req.prompt.user },
-          ],
-          max_completion_tokens: this.opts.maxOutputTokens,
-          // `strict: false` because our schemas use optional fields, which strict
-          // mode does not allow. The Zod schema is the real guarantee: the caller
-          // validates the result before using it.
-          response_format: {
-            type: 'json_schema',
-            json_schema: { name: req.schemaName, schema: toJsonSchema(req.schema), strict: false },
-          },
-        },
-        { signal: req.signal },
-      );
+      const completion = await this.client.chat.completions.create(params, {
+        signal: req.signal,
+      });
       const choice = completion.choices[0];
       if (choice?.message.refusal) {
         throw new LlmError('model_refused', choice.message.refusal);
@@ -134,18 +174,9 @@ export class OpenAiProvider implements LlmProvider {
       if (choice?.finish_reason === 'length') {
         throw new LlmError('output_truncated', 'OpenAI structured output hit the token limit');
       }
-      const content = choice?.message.content ?? '';
-      let value: unknown;
-      try {
-        value = JSON.parse(content);
-      } catch (err) {
-        throw new LlmError('invalid_model_output', 'OpenAI returned non-JSON content', {
-          cause: err,
-        });
-      }
       const u = completion.usage;
       return {
-        value,
+        value: parseModelJson(choice?.message.content ?? ''),
         usage: u
           ? {
               inputTokens: u.prompt_tokens - (u.prompt_tokens_details?.cached_tokens ?? 0),
@@ -154,6 +185,7 @@ export class OpenAiProvider implements LlmProvider {
               cacheWriteTokens: 0,
             }
           : ZERO_USAGE,
+        ...(this.served(completion.model) && { servedModel: completion.model }),
       };
     } catch (err) {
       throw mapOpenAiError(err);

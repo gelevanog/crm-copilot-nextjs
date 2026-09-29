@@ -7,8 +7,8 @@ import {
   parsedFilterSchema,
   type Activity,
   type AiFeature,
-  type ChatMessage,
   type ChatStreamEvent,
+  type ConversationSummary,
   type DealStage,
   type EmailTone,
   type FollowUpEmail,
@@ -21,13 +21,29 @@ import type { Env } from '../config/env';
 import { CompaniesService } from '../companies/companies.service';
 import { DealsService } from '../deals/deals.service';
 import { ChatAgent } from './chat/chat-agent';
+import { ConversationsService } from './conversations/conversations.service';
+import type { TranscriptEntry } from './conversations/transcript';
 import { LlmError } from './llm/llm-error';
-import { LLM_PROVIDER, ZERO_USAGE, type LlmProvider, type TokenUsage } from './llm/llm.types';
-import { renderTask, type ActivitySnippet, type StructuredTask } from './prompts/templates';
+import {
+  addUsage,
+  LLM_PROVIDER,
+  ZERO_USAGE,
+  type LlmProvider,
+  type TokenUsage,
+} from './llm/llm.types';
+import {
+  renderTask,
+  withValidationFeedback,
+  type ActivitySnippet,
+  type StructuredTask,
+} from './prompts/templates';
 import { CrmToolsService } from './tools/crm-tools';
 import { UsageService } from './usage/usage.service';
 
 const today = () => new Date().toISOString().slice(0, 10);
+
+/** One retry with the validation issues fed back, for models without native structured outputs. */
+const MAX_STRUCTURED_ATTEMPTS = 2;
 
 function toSnippet(a: Activity, maxBody = 600): ActivitySnippet {
   return {
@@ -42,6 +58,7 @@ function toSnippet(a: Activity, maxBody = 600): ActivitySnippet {
 export class AiService {
   private readonly logger = new Logger(AiService.name);
   private readonly agent: ChatAgent;
+  private readonly contextMaxTokens: number;
 
   constructor(
     @Inject(LLM_PROVIDER) private readonly provider: LlmProvider,
@@ -50,57 +67,88 @@ export class AiService {
     private readonly usage: UsageService,
     private readonly deals: DealsService,
     private readonly companies: CompaniesService,
+    private readonly conversations: ConversationsService,
   ) {
     this.agent = new ChatAgent(provider, tools, env.AI_MAX_TOOL_ITERATIONS);
+    this.contextMaxTokens = env.AI_CONTEXT_MAX_TOKENS;
   }
 
   /**
-   * Runs the copilot chat and streams events through `emit`. Never throws:
-   * failures are reported as an `error` event after any partial output.
+   * Answers `message` in a saved conversation and streams events through
+   * `emit`. The question is stored first; the model sees the stored history
+   * trimmed to the context budget; the new steps are stored when the run ends,
+   * including a closing entry when it fails. Never throws: failures are
+   * reported as an `error` event after any partial output.
    */
   async chat(
     user: AuthUser,
-    messages: ChatMessage[],
+    conversation: ConversationSummary,
+    message: string,
     emit: (event: ChatStreamEvent) => void,
     signal?: AbortSignal,
   ): Promise<void> {
     const started = Date.now();
     let usage: TokenUsage = ZERO_USAGE;
+    let model = this.provider.model;
     let toolCalls = 0;
     let errorCode: string | null = null;
+    const recorded: TranscriptEntry[] = [];
+    emit({ type: 'conversation', id: conversation.id, title: conversation.title });
     try {
+      await this.conversations.append(user, conversation.id, [{ role: 'user', text: message }]);
+      const history = await this.conversations.modelContext(
+        user,
+        conversation.id,
+        this.contextMaxTokens,
+      );
       const result = await this.agent.run(
-        { ctx: { scope: user }, userName: user.name, messages, signal },
+        {
+          ctx: { scope: user, conversationId: conversation.id },
+          userName: user.name,
+          history,
+          signal,
+        },
         emit,
+        (entry) => recorded.push(entry),
       );
       usage = result.usage;
       toolCalls = result.toolCalls;
-      emit({
-        type: 'done',
-        provider: this.provider.name,
-        model: this.provider.model,
-        usage: {
-          inputTokens: usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens,
-          outputTokens: usage.outputTokens,
-          costUsd: this.usage.costOf(this.provider.model, usage),
-        },
-      });
+      model = result.servedModel ?? model;
+      const summary = {
+        inputTokens: usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens,
+        outputTokens: usage.outputTokens,
+        costUsd: this.usage.costOf(model, usage),
+      };
+      const last = recorded.at(-1);
+      if (last?.role === 'assistant') {
+        last.meta = { provider: this.provider.name, model, usage: summary };
+      }
+      emit({ type: 'done', provider: this.provider.name, model, usage: summary });
     } catch (err) {
       const llmError = err instanceof LlmError ? err : null;
       errorCode = llmError?.code ?? 'internal_error';
-      if (!llmError) this.logger.error(`chat failed: ${(err as Error).stack ?? String(err)}`);
-      emit({
-        type: 'error',
-        code: errorCode,
-        message:
-          llmError?.publicMessage ?? 'Something went wrong while answering. Please try again.',
+      if (llmError) this.logger.warn(`chat failed: ${llmError.code}: ${llmError.message}`);
+      else this.logger.error(`chat failed: ${(err as Error).stack ?? String(err)}`);
+      const publicMessage =
+        llmError?.publicMessage ?? 'Something went wrong while answering. Please try again.';
+      recorded.push({
+        role: 'assistant',
+        text: '',
+        toolCalls: [],
+        error: { code: errorCode, message: publicMessage },
       });
+      emit({ type: 'error', code: errorCode, message: publicMessage });
     } finally {
+      await this.conversations
+        .append(user, conversation.id, recorded)
+        .catch((err: unknown) =>
+          this.logger.error(`Failed to save conversation: ${(err as Error).message}`),
+        );
       await this.usage.record({
         scope: user,
         feature: 'chat',
         provider: this.provider.name,
-        model: this.provider.model,
+        model,
         usage,
         latencyMs: Date.now() - started,
         toolCalls,
@@ -168,7 +216,8 @@ export class AiService {
 
   /**
    * Structured-output call with validation and usage accounting. The model's
-   * JSON is only trusted after it passes the shared Zod schema.
+   * JSON is only trusted after it passes the shared Zod schema; an invalid
+   * answer gets one retry with the validation issues fed back.
    */
   private async structured<S extends z.ZodType>(
     user: AuthUser,
@@ -179,25 +228,36 @@ export class AiService {
   ): Promise<z.infer<S>> {
     const started = Date.now();
     let usage: TokenUsage = ZERO_USAGE;
+    let model = this.provider.model;
     let errorCode: string | null = null;
+    let prompt = renderTask(task);
     try {
-      const result = await this.provider.generateStructured({
-        task,
-        prompt: renderTask(task),
-        schema,
-        schemaName,
-      });
-      usage = result.usage;
-      const parsed = schema.safeParse(result.value);
-      if (!parsed.success) {
+      for (let attempt = 1; ; attempt++) {
+        let issues: string[];
+        try {
+          const result = await this.provider.generateStructured({
+            task,
+            prompt,
+            schema,
+            schemaName,
+          });
+          usage = addUsage(usage, result.usage);
+          model = result.servedModel ?? model;
+          const parsed = schema.safeParse(result.value);
+          if (parsed.success) return parsed.data;
+          issues = parsed.error.issues.map((i) => `${i.path.join('.') || 'value'}: ${i.message}`);
+        } catch (err) {
+          if (!(err instanceof LlmError && err.code === 'invalid_model_output')) throw err;
+          issues = ['the answer was not a JSON object'];
+        }
         this.logger.warn(
-          `${feature}: model output failed validation: ${parsed.error.issues
-            .map((i) => `${i.path.join('.')}: ${i.message}`)
-            .join('; ')}`,
+          `${feature}: model output failed validation (attempt ${attempt}): ${issues.join('; ')}`,
         );
-        throw new LlmError('invalid_model_output', 'Structured output failed schema validation');
+        if (attempt >= MAX_STRUCTURED_ATTEMPTS) {
+          throw new LlmError('invalid_model_output', 'Structured output failed schema validation');
+        }
+        prompt = withValidationFeedback(renderTask(task), issues);
       }
-      return parsed.data;
     } catch (err) {
       errorCode = err instanceof LlmError ? err.code : 'internal_error';
       throw err;
@@ -206,7 +266,7 @@ export class AiService {
         scope: user,
         feature,
         provider: this.provider.name,
-        model: this.provider.model,
+        model,
         usage,
         latencyMs: Date.now() - started,
         success: errorCode === null,

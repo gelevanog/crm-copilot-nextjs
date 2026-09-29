@@ -36,30 +36,55 @@ enum AiFeature {
   nl_filter
 }
 
+enum ConversationMessageRole {
+  user
+  assistant
+  tool_results
+  note
+}
+
+enum ProposedActionKind {
+  deal_stage_change
+  deal_update
+  activity
+}
+
+enum ProposedActionStatus {
+  pending
+  approved
+  rejected
+  expired
+  stale
+}
+
 model Workspace {
-  id         String     @id @default(cuid())
-  name       String
-  slug       String     @unique
-  createdAt  DateTime   @default(now())
-  users      User[]
-  companies  Company[]
-  contacts   Contact[]
-  deals      Deal[]
-  activities Activity[]
-  aiUsage    AiUsage[]
+  id              String           @id @default(cuid())
+  name            String
+  slug            String           @unique
+  createdAt       DateTime         @default(now())
+  users           User[]
+  companies       Company[]
+  contacts        Contact[]
+  deals           Deal[]
+  activities      Activity[]
+  aiUsage         AiUsage[]
+  conversations   Conversation[]
+  proposedActions ProposedAction[]
 }
 
 model User {
-  id           String     @id @default(cuid())
-  workspaceId  String
-  workspace    Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  email        String     @unique
-  name         String
-  passwordHash String
-  createdAt    DateTime   @default(now())
-  deals        Deal[]
-  activities   Activity[]
-  aiUsage      AiUsage[]
+  id              String           @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email           String           @unique
+  name            String
+  passwordHash    String
+  createdAt       DateTime         @default(now())
+  deals           Deal[]
+  activities      Activity[]
+  aiUsage         AiUsage[]
+  conversations   Conversation[]
+  proposedActions ProposedAction[]
 
   @@index([workspaceId])
 }
@@ -168,4 +193,65 @@ model AiUsage {
   createdAt    DateTime  @default(now())
 
   @@index([workspaceId, createdAt])
+}
+
+/// A saved copilot chat. It is private to the user who started it: every read
+/// and write filters on both `workspaceId` and `userId`.
+model Conversation {
+  id              String                @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title           String
+  /// Incremented atomically to allocate `ConversationMessage.seq` values.
+  messageCount    Int                   @default(0)
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+  messages        ConversationMessage[]
+  proposedActions ProposedAction[]
+
+  @@index([workspaceId, userId, updatedAt])
+}
+
+/// One transcript entry. `content` is provider-neutral JSON (validated with Zod
+/// when read), so a conversation can be continued after switching providers.
+model ConversationMessage {
+  id             String                  @id @default(cuid())
+  conversationId String
+  conversation   Conversation            @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  seq            Int
+  role           ConversationMessageRole
+  content        Json
+  createdAt      DateTime                @default(now())
+
+  @@unique([conversationId, seq])
+}
+
+/// A change proposed by the copilot. Nothing is written to the CRM until the
+/// user approves it through a regular authenticated API call.
+model ProposedAction {
+  id             String               @id @default(cuid())
+  workspaceId    String
+  workspace      Workspace            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversationId String
+  conversation   Conversation         @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  kind           ProposedActionKind
+  status         ProposedActionStatus @default(pending)
+  /// The exact request body that approval executes (re-validated on approval).
+  payload        Json
+  /// Confirmation card content: title, target and before/after rows.
+  preview        Json
+  /// `Deal.updatedAt` when proposed; approval is refused if the deal changed since.
+  baseVersion    DateTime?
+  reason         String?
+  resultMessage  String?
+  expiresAt      DateTime
+  decidedAt      DateTime?
+  createdAt      DateTime             @default(now())
+
+  @@index([workspaceId, userId, status])
+  @@index([conversationId])
 }

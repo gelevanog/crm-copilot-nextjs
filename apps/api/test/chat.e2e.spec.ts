@@ -62,23 +62,21 @@ describe.skipIf(!dbAvailable)('AI endpoints e2e (fake provider, Postgres)', () =
     const res = await request(app.getHttpServer())
       .post('/ai/chat')
       .set(auth())
-      .send({ messages: [{ role: 'assistant', content: 'hi' }] })
+      .send({ message: '   ' })
       .expect(400);
     expect(res.body.message).toBe('Validation failed');
+    await request(app.getHttpServer())
+      .post('/ai/chat')
+      .set(auth())
+      .send({ message: 'hi', workspaceId: 'someone-else' })
+      .expect(400);
   });
 
   it('streams tool calls, tool results and the answer as NDJSON', async () => {
     const res = await request(app.getHttpServer())
       .post('/ai/chat')
       .set(auth())
-      .send({
-        messages: [
-          {
-            role: 'user',
-            content: 'Which deals over $20k are stuck in Negotiation for more than 2 weeks?',
-          },
-        ],
-      })
+      .send({ message: 'Which deals over $20k are stuck in Negotiation for more than 2 weeks?' })
       .expect(200)
       .expect('Content-Type', /application\/x-ndjson/);
 

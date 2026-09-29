@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ACTIVITY_TYPES, EMAIL_TONES, type AiFeature } from './enums';
+import { ACTIVITY_TYPES, DEAL_STAGES, EMAIL_TONES, type AiFeature } from './enums';
 import { dealFilterSchema } from './deal-filter';
 
 /* -------------------------------------------------------------------------- */
@@ -52,39 +52,171 @@ export const getPipelineStatsInputSchema = z
   })
   .strict();
 
+/* -------------------------------------------------------------------------- */
+/* Write tools: the model can only *propose* a change                          */
+/* -------------------------------------------------------------------------- */
+
+const dealReference = z
+  .string()
+  .trim()
+  .min(1)
+  .max(120)
+  .describe(
+    'The deal title (e.g. "Fleet telematics rollout") or, when the user only names the account, the company name (e.g. "Acme").',
+  );
+
+const proposalReason = z
+  .string()
+  .trim()
+  .min(1)
+  .max(300)
+  .optional()
+  .describe('One short sentence explaining the change, shown to the user next to the diff.');
+
+export const proposeDealStageChangeInputSchema = z
+  .object({
+    deal: dealReference,
+    stage: z.enum(DEAL_STAGES).describe('The pipeline stage to move the deal to.'),
+    reason: proposalReason,
+  })
+  .strict();
+
+export const proposeDealUpdateInputSchema = z
+  .object({
+    deal: dealReference,
+    amount: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(1_000_000_000)
+      .optional()
+      .describe('New deal amount in whole USD ("$50k" = 50000).'),
+    expectedCloseDate: z.iso
+      .date()
+      .nullable()
+      .optional()
+      .describe('New expected close date as YYYY-MM-DD, or null to clear it.'),
+    ownerName: z
+      .string()
+      .trim()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe('Name or email of the workspace user who should own the deal.'),
+    reason: proposalReason,
+  })
+  .strict()
+  .refine(
+    (v) => v.amount !== undefined || v.expectedCloseDate !== undefined || v.ownerName !== undefined,
+    { message: 'Provide at least one of amount, expectedCloseDate or ownerName' },
+  );
+
+export const proposeActivityInputSchema = z
+  .object({
+    type: z
+      .enum(ACTIVITY_TYPES)
+      .describe(
+        'NOTE for notes, TASK for to-dos, CALL / EMAIL / MEETING to log an interaction that already happened.',
+      ),
+    subject: z.string().trim().min(1).max(200).describe('Short subject line.'),
+    body: z.string().trim().min(1).max(2000).optional().describe('Optional details.'),
+    deal: dealReference.optional(),
+    companyName: z
+      .string()
+      .trim()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe('Company to link the activity to when it is not about one specific deal.'),
+  })
+  .strict()
+  .refine((v) => v.deal !== undefined || v.companyName !== undefined, {
+    message: 'Link the activity to a deal or a company',
+  });
+
 export type SearchDealsInput = z.infer<typeof searchDealsInputSchema>;
 export type GetCompanyInput = z.infer<typeof getCompanyInputSchema>;
 export type ListActivitiesInput = z.infer<typeof listActivitiesInputSchema>;
 export type GetPipelineStatsInput = z.infer<typeof getPipelineStatsInputSchema>;
+export type ProposeDealStageChangeInput = z.infer<typeof proposeDealStageChangeInputSchema>;
+export type ProposeDealUpdateInput = z.infer<typeof proposeDealUpdateInputSchema>;
+export type ProposeActivityInput = z.infer<typeof proposeActivityInputSchema>;
 
-export const TOOL_NAMES = [
+export const READ_TOOL_NAMES = [
   'searchDeals',
   'getCompany',
   'listActivities',
   'getPipelineStats',
 ] as const;
+export const WRITE_TOOL_NAMES = [
+  'proposeDealStageChange',
+  'proposeDealUpdate',
+  'proposeActivity',
+] as const;
+export const TOOL_NAMES = [...READ_TOOL_NAMES, ...WRITE_TOOL_NAMES] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
 /* -------------------------------------------------------------------------- */
-/* Copilot chat                                                                */
+/* Proposed actions (pending changes the user approves or rejects)             */
 /* -------------------------------------------------------------------------- */
 
-export const chatMessageSchema = z.object({
-  role: z.enum(['user', 'assistant']),
-  content: z.string().trim().min(1).max(4000),
-});
-export type ChatMessage = z.infer<typeof chatMessageSchema>;
+export const PROPOSED_ACTION_KINDS = ['deal_stage_change', 'deal_update', 'activity'] as const;
+export type ProposedActionKind = (typeof PROPOSED_ACTION_KINDS)[number];
 
-export const chatRequestSchema = z.object({
-  messages: z
-    .array(chatMessageSchema)
-    .min(1)
-    .max(30)
-    .refine((m) => m[m.length - 1]?.role === 'user', {
-      message: 'The last message must come from the user',
-    }),
-});
+/**
+ * `stale`: the target record changed (or disappeared) after the proposal was
+ * made, so approving it would overwrite something the model never saw.
+ */
+export const PROPOSED_ACTION_STATUSES = [
+  'pending',
+  'approved',
+  'rejected',
+  'expired',
+  'stale',
+] as const;
+export type ProposedActionStatus = (typeof PROPOSED_ACTION_STATUSES)[number];
+
+/** One row of the before/after diff shown on the confirmation card. */
+export interface ProposedActionChange {
+  field: string;
+  label: string;
+  before: string | null;
+  after: string | null;
+}
+
+export interface ProposedActionView {
+  id: string;
+  kind: ProposedActionKind;
+  status: ProposedActionStatus;
+  /** e.g. "Move deal to Proposal" */
+  title: string;
+  target: { label: string; href: string | null };
+  changes: ProposedActionChange[];
+  reason: string | null;
+  createdAt: string;
+  expiresAt: string;
+  decidedAt: string | null;
+  /** Outcome detail, e.g. why a proposal went stale. */
+  resultMessage: string | null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Copilot chat and saved conversations                                        */
+/* -------------------------------------------------------------------------- */
+
+export const chatRequestSchema = z
+  .object({
+    /** Continue this saved conversation; omit to start a new one. */
+    conversationId: z.string().trim().min(1).max(64).optional(),
+    message: z.string().trim().min(1).max(4000),
+  })
+  .strict();
 export type ChatRequest = z.infer<typeof chatRequestSchema>;
+
+export const renameConversationRequestSchema = z
+  .object({ title: z.string().trim().min(1).max(120) })
+  .strict();
+export type RenameConversationRequest = z.infer<typeof renameConversationRequestSchema>;
 
 /** Compact tabular payload a tool result can carry for the chat UI. */
 export interface ResultTable {
@@ -100,6 +232,7 @@ export interface UsageSummary {
 
 /** Newline-delimited JSON events streamed by `POST /ai/chat`. */
 export type ChatStreamEvent =
+  | { type: 'conversation'; id: string; title: string }
   | { type: 'text'; delta: string }
   | { type: 'tool_call'; id: string; name: string; input: unknown }
   | {
@@ -109,9 +242,44 @@ export type ChatStreamEvent =
       ok: boolean;
       summary: string;
       table?: ResultTable;
+      proposal?: ProposedActionView;
     }
   | { type: 'done'; provider: string; model: string; usage: UsageSummary }
   | { type: 'error'; code: string; message: string };
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A tool call and its result, as re-rendered from a saved conversation. */
+export interface ToolActivityView {
+  id: string;
+  name: string;
+  input: unknown;
+  ok: boolean;
+  summary: string;
+  table?: ResultTable;
+  /** Current state of the proposal (read fresh, not as it was when proposed). */
+  proposal?: ProposedActionView;
+}
+
+export type ChatTurn =
+  | { id: string; role: 'user'; content: string }
+  | {
+      id: string;
+      role: 'assistant';
+      content: string;
+      tools: ToolActivityView[];
+      error: string | null;
+      meta: { model: string; usage: UsageSummary } | null;
+    };
+
+export interface ConversationDetail extends ConversationSummary {
+  turns: ChatTurn[];
+}
 
 /* -------------------------------------------------------------------------- */
 /* Smart actions (structured outputs)                                          */

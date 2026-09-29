@@ -1,34 +1,28 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ActivitiesService } from '../src/activities/activities.service';
-import {
-  CrmToolsService,
-  type GetCompanyData,
-  type SearchDealsData,
-} from '../src/ai/tools/crm-tools';
-import { CompaniesService } from '../src/companies/companies.service';
-import { DealsService } from '../src/deals/deals.service';
+import type { GetCompanyData, SearchDealsData, ToolContext } from '../src/ai/tools/crm-tools';
 import { PrismaService } from '../src/prisma/prisma.module';
 import { seedDatabase } from '../src/seed/seed';
 import { prepareTestDatabase } from './helpers/db';
+import { createServices } from './helpers/services';
 
 const dbAvailable = await prepareTestDatabase();
 
 describe.skipIf(!dbAvailable)('CRM tools (Postgres)', () => {
   const prisma = new PrismaService();
-  const tools = new CrmToolsService(
-    new DealsService(prisma),
-    new CompaniesService(prisma),
-    new ActivitiesService(prisma),
-  );
-  let northwind: { scope: { workspaceId: string; userId: string } };
-  let globex: { scope: { workspaceId: string; userId: string } };
+  const { tools, conversations } = createServices(prisma);
+  let northwind: ToolContext;
+  let globex: ToolContext;
 
   beforeAll(async () => {
     await seedDatabase(prisma, { reset: true });
     const alex = await prisma.user.findUniqueOrThrow({ where: { email: 'alex@northwind.test' } });
     const jordan = await prisma.user.findUniqueOrThrow({ where: { email: 'jordan@globex.test' } });
-    northwind = { scope: { workspaceId: alex.workspaceId, userId: alex.id } };
-    globex = { scope: { workspaceId: jordan.workspaceId, userId: jordan.id } };
+    const context = async (u: typeof alex): Promise<ToolContext> => {
+      const scope = { workspaceId: u.workspaceId, userId: u.id };
+      return { scope, conversationId: (await conversations.create(scope, 'Tools test')).id };
+    };
+    northwind = await context(alex);
+    globex = await context(jordan);
   });
 
   afterAll(() => prisma.$disconnect());

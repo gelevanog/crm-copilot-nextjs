@@ -20,6 +20,8 @@ export interface AnthropicProviderOptions {
   effort: 'low' | 'medium' | 'high';
   maxOutputTokens: number;
   timeoutMs: number;
+  /** SDK retries for rate limits and transient failures. */
+  maxRetries: number;
   /** Custom fetch (used by tests to replay recorded HTTP streams). */
   fetch?: typeof fetch;
 }
@@ -38,7 +40,7 @@ export class AnthropicProvider implements LlmProvider {
     this.client = new Anthropic({
       apiKey: opts.apiKey,
       timeout: opts.timeoutMs,
-      maxRetries: 2,
+      maxRetries: opts.maxRetries,
       ...(opts.fetch && { fetch: opts.fetch }),
     });
   }
@@ -132,35 +134,58 @@ export class AnthropicProvider implements LlmProvider {
   }
 }
 
+/**
+ * Maps the neutral history to Messages API turns. Consecutive user-role items
+ * (tool results followed by an app note or the next question) are merged into
+ * one user turn, tool_result blocks first, instead of relying on the API to
+ * combine them.
+ */
 function toAnthropicMessages(items: ConversationItem[]): Anthropic.MessageParam[] {
-  return items.map((item): Anthropic.MessageParam => {
-    switch (item.role) {
-      case 'user':
-        return { role: 'user', content: item.text };
-      case 'assistant': {
-        if (Array.isArray(item.providerState)) {
-          return { role: 'assistant', content: item.providerState as Anthropic.ContentBlock[] };
-        }
-        const blocks: Anthropic.ContentBlockParam[] = [];
-        if (item.text) blocks.push({ type: 'text', text: item.text });
-        for (const call of item.toolCalls) {
-          blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
-        }
-        return { role: 'assistant', content: blocks.length ? blocks : item.text };
-      }
-      case 'tool_results':
-        // All results of one turn go back in a single user message.
-        return {
-          role: 'user',
-          content: item.results.map((r) => ({
-            type: 'tool_result' as const,
-            tool_use_id: r.toolCallId,
-            content: r.content,
-            is_error: r.isError,
-          })),
-        };
+  const messages: Anthropic.MessageParam[] = [];
+  for (const item of items) {
+    const next = toAnthropicMessage(item);
+    const prev = messages.at(-1);
+    if (prev?.role === 'user' && next.role === 'user') {
+      prev.content = [...toBlocks(prev.content), ...toBlocks(next.content)];
+    } else {
+      messages.push(next);
     }
-  });
+  }
+  return messages;
+}
+
+function toAnthropicMessage(item: ConversationItem): Anthropic.MessageParam {
+  switch (item.role) {
+    case 'user':
+      return { role: 'user', content: item.text };
+    case 'assistant': {
+      if (Array.isArray(item.providerState)) {
+        return { role: 'assistant', content: item.providerState as Anthropic.ContentBlock[] };
+      }
+      // Earlier turns of a saved conversation: text and tool calls, no thinking.
+      const blocks: Anthropic.ContentBlockParam[] = [];
+      if (item.text) blocks.push({ type: 'text', text: item.text });
+      for (const call of item.toolCalls) {
+        blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
+      }
+      return { role: 'assistant', content: blocks.length ? blocks : item.text };
+    }
+    case 'tool_results':
+      // All results of one turn go back in a single user message.
+      return {
+        role: 'user',
+        content: item.results.map((r) => ({
+          type: 'tool_result' as const,
+          tool_use_id: r.toolCallId,
+          content: r.content,
+          is_error: r.isError,
+        })),
+      };
+  }
+}
+
+function toBlocks(content: Anthropic.MessageParam['content']): Anthropic.ContentBlockParam[] {
+  return typeof content === 'string' ? [{ type: 'text', text: content }] : content;
 }
 
 function mapStopReason(reason: Anthropic.StopReason | null): StopReason {

@@ -1,13 +1,19 @@
-import type { ChatStreamEvent } from '@crm/shared';
+import type { ChatStreamEvent, ProposedActionView } from '@crm/shared';
 import { describe, expect, it, vi } from 'vitest';
 import { ChatAgent } from '../src/ai/chat/chat-agent';
+import type { TranscriptEntry } from '../src/ai/conversations/transcript';
 import { FakeProvider } from '../src/ai/llm/fake/fake.provider';
 import { LlmError } from '../src/ai/llm/llm-error';
-import type { LlmProvider, TurnRequest, TurnResult } from '../src/ai/llm/llm.types';
+import type {
+  ConversationItem,
+  LlmProvider,
+  TurnRequest,
+  TurnResult,
+} from '../src/ai/llm/llm.types';
 import { ZERO_USAGE } from '../src/ai/llm/llm.types';
 import type { ToolOutcome } from '../src/ai/tools/crm-tools';
 
-const ctx = { scope: { workspaceId: 'ws_1', userId: 'user_1' } };
+const ctx = { scope: { workspaceId: 'ws_1', userId: 'user_1' }, conversationId: 'conv_1' };
 
 function stubTools(outcome: (name: string, input: unknown) => ToolOutcome) {
   return {
@@ -33,14 +39,16 @@ function scriptedProvider(turns: Partial<TurnResult>[]) {
   return { provider, requests };
 }
 
-async function run(agent: ChatAgent, question: string) {
+async function run(agent: ChatAgent, question: string, earlier: ConversationItem[] = []) {
   const events: ChatStreamEvent[] = [];
+  const recorded: TranscriptEntry[] = [];
   const result = await agent.run(
-    { ctx, userName: 'Alex', messages: [{ role: 'user', content: question }] },
+    { ctx, userName: 'Alex', history: [...earlier, { role: 'user', text: question }] },
     (e) => events.push(e),
+    (entry) => recorded.push(entry),
   );
   const text = events.flatMap((e) => (e.type === 'text' ? [e.delta] : [])).join('');
-  return { events, result, text };
+  return { events, result, text, recorded };
 }
 
 describe('ChatAgent with the fake provider', () => {
@@ -67,7 +75,7 @@ describe('ChatAgent with the fake provider', () => {
     }));
     const agent = new ChatAgent(new FakeProvider(), tools, 5);
 
-    const { events, result, text } = await run(
+    const { events, result, text, recorded } = await run(
       agent,
       'Which deals over $20k are stuck in Negotiation for more than 2 weeks?',
     );
@@ -84,6 +92,60 @@ describe('ChatAgent with the fake provider', () => {
     expect(text).toContain('**Claims automation suite**');
     expect(result).toMatchObject({ toolCalls: 1, iterations: 2 });
     expect(result.usage.inputTokens).toBeGreaterThan(0);
+
+    // Each completed step is handed over for persistence, with UI metadata.
+    expect(recorded.map((e) => e.role)).toEqual(['assistant', 'tool_results', 'assistant']);
+    expect(recorded[1]).toMatchObject({
+      role: 'tool_results',
+      results: [{ name: 'searchDeals', isError: false, summary: '1 deal found' }],
+    });
+    expect(recorded[2]).toMatchObject({ role: 'assistant', toolCalls: [] });
+  });
+
+  it('sends the earlier conversation to the model before the new question', async () => {
+    const { provider, requests } = scriptedProvider([{ text: 'Yes, still Negotiation.' }]);
+    const tools = stubTools(() => ({ ok: true, summary: '', data: {} }));
+    const earlier: ConversationItem[] = [
+      { role: 'user', text: 'What stage is Fleet telematics in?' },
+      { role: 'assistant', text: 'Negotiation.', toolCalls: [] },
+    ];
+
+    await run(new ChatAgent(provider, tools, 5), 'Is it still there?', earlier);
+
+    expect(requests[0]!.items).toEqual([...earlier, { role: 'user', text: 'Is it still there?' }]);
+  });
+
+  it('surfaces a write tool proposal in the stream and records only its id', async () => {
+    const proposal = {
+      id: 'prop_1',
+      kind: 'deal_stage_change',
+      status: 'pending',
+      title: 'Move deal to Proposal',
+    } as ProposedActionView;
+    const tools = stubTools(() => ({
+      ok: true,
+      summary: 'Proposed: Move deal to Proposal',
+      proposal,
+      data: {
+        status: 'pending_approval',
+        title: 'Move deal to Proposal',
+        target: 'Fleet telematics rollout · Acme Logistics',
+        changes: [{ field: 'stage', before: 'Negotiation', after: 'Proposal' }],
+        expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+        note: 'Nothing has been changed yet.',
+      },
+    }));
+    const agent = new ChatAgent(new FakeProvider(), tools, 5);
+
+    const { events, text, recorded } = await run(agent, 'Move the Acme deal to Proposal');
+
+    expect(tools.execute).toHaveBeenCalledWith(ctx, 'proposeDealStageChange', {
+      deal: 'Acme',
+      stage: 'PROPOSAL',
+    });
+    expect(events.find((e) => e.type === 'tool_result')).toMatchObject({ proposal });
+    expect(recorded[1]).toMatchObject({ results: [{ proposalId: 'prop_1' }] });
+    expect(text).toContain('Nothing has been changed yet');
   });
 
   it('issues parallel tool calls for an account summary and returns all results together', async () => {
@@ -156,10 +218,12 @@ describe('ChatAgent loop guards', () => {
     const { provider, requests } = scriptedProvider([loop, loop, loop, loop]);
     const tools = stubTools(() => ({ ok: true, summary: '', data: {} }));
 
-    const { result, text } = await run(new ChatAgent(provider, tools, 3), 'loop forever');
+    const { result, text, recorded } = await run(new ChatAgent(provider, tools, 3), 'loop forever');
     expect(requests).toHaveLength(3);
     expect(result.iterations).toBe(3);
     expect(text).toContain('I stopped after several lookups');
+    // The saved transcript still ends with a closed assistant turn.
+    expect(recorded.at(-1)).toMatchObject({ role: 'assistant', toolCalls: [] });
   });
 
   it('never runs a tool call truncated by max_tokens', async () => {
@@ -167,10 +231,16 @@ describe('ChatAgent loop guards', () => {
       { toolCalls: [{ id: 'x', name: 'searchDeals', input: {} }], stopReason: 'max_tokens' },
     ]);
     const tools = stubTools(() => ({ ok: true, summary: '', data: {} }));
-    await expect(run(new ChatAgent(provider, tools, 3), 'q')).rejects.toMatchObject({
-      code: 'output_truncated',
-    });
+    const recorded: TranscriptEntry[] = [];
+    await expect(
+      new ChatAgent(provider, tools, 3).run(
+        { ctx, userName: 'Alex', history: [{ role: 'user', text: 'q' }] },
+        () => undefined,
+        (e) => recorded.push(e),
+      ),
+    ).rejects.toMatchObject({ code: 'output_truncated' });
     expect(tools.execute).not.toHaveBeenCalled();
+    expect(recorded).toEqual([]);
   });
 
   it('surfaces refusals as a typed error', async () => {

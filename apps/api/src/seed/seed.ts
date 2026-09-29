@@ -25,6 +25,8 @@ export async function seedDatabase(prisma: PrismaClient, opts: SeedOptions = {})
   } else {
     // Children first: some relations (deal owner, activity author) are RESTRICT.
     await prisma.$transaction([
+      prisma.proposedAction.deleteMany(),
+      prisma.conversation.deleteMany(),
       prisma.aiUsage.deleteMany(),
       prisma.activity.deleteMany(),
       prisma.deal.deleteMany(),

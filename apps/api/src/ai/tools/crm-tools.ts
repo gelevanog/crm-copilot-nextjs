@@ -5,8 +5,12 @@ import {
   getCompanyInputSchema,
   getPipelineStatsInputSchema,
   listActivitiesInputSchema,
+  proposeActivityInputSchema,
+  proposeDealStageChangeInputSchema,
+  proposeDealUpdateInputSchema,
   searchDealsInputSchema,
   type DealStage,
+  type ProposedActionView,
   type ResultTable,
   type ToolName,
 } from '@crm/shared';
@@ -14,6 +18,7 @@ import type { TenantScope } from '../../common/tenant-scope';
 import { ActivitiesService } from '../../activities/activities.service';
 import { CompaniesService } from '../../companies/companies.service';
 import { DealsService } from '../../deals/deals.service';
+import { ProposalRejectedError, ProposedActionsService } from '../actions/proposed-actions.service';
 import { toJsonSchema } from '../llm/json-schema';
 import type { ToolSpec } from '../llm/llm.types';
 import { TOOL_DESCRIPTIONS } from '../prompts/templates';
@@ -65,6 +70,16 @@ export interface ListActivitiesData {
   activities: ActivityRow[];
 }
 
+/** What a write tool returns to the model: a pending proposal, not a change. */
+export interface ProposalToolData {
+  status: 'pending_approval';
+  title: string;
+  target: string;
+  changes: { field: string; before: string | null; after: string | null }[];
+  expiresAt: string;
+  note: string;
+}
+
 export interface ToolOutcome {
   ok: boolean;
   /** JSON-serialisable payload for the model. */
@@ -72,11 +87,15 @@ export interface ToolOutcome {
   /** One-line human summary shown in the UI chip. */
   summary: string;
   table?: ResultTable;
+  /** Set by write tools: rendered as a confirmation card. */
+  proposal?: ProposedActionView;
 }
 
 export interface ToolContext {
   /** Derived from the authenticated request, never from model output. */
   scope: TenantScope;
+  /** The saved conversation proposals are attached to (server-side, never from the model). */
+  conversationId: string;
 }
 
 interface CrmTool {
@@ -128,6 +147,7 @@ export class CrmToolsService {
     private readonly deals: DealsService,
     private readonly companies: CompaniesService,
     private readonly activities: ActivitiesService,
+    private readonly proposals: ProposedActionsService,
   ) {
     this.tools = [
       defineTool({
@@ -149,6 +169,21 @@ export class CrmToolsService {
         name: 'getPipelineStats',
         schema: getPipelineStatsInputSchema,
         execute: (ctx, input) => this.getPipelineStats(ctx, input.ownedByMe ?? false),
+      }),
+      defineTool({
+        name: 'proposeDealStageChange',
+        schema: proposeDealStageChangeInputSchema,
+        execute: (ctx, input) => this.propose(() => this.proposals.proposeStageChange(ctx, input)),
+      }),
+      defineTool({
+        name: 'proposeDealUpdate',
+        schema: proposeDealUpdateInputSchema,
+        execute: (ctx, input) => this.propose(() => this.proposals.proposeDealUpdate(ctx, input)),
+      }),
+      defineTool({
+        name: 'proposeActivity',
+        schema: proposeActivityInputSchema,
+        execute: (ctx, input) => this.propose(() => this.proposals.proposeActivity(ctx, input)),
       }),
     ];
   }
@@ -332,6 +367,33 @@ export class CrmToolsService {
         })),
       },
     };
+  }
+
+  /** Runs a `propose*` call and shapes the result for the model and the confirmation card. */
+  private async propose(create: () => Promise<ProposedActionView>): Promise<ToolOutcome> {
+    try {
+      const proposal = await create();
+      const data: ProposalToolData = {
+        status: 'pending_approval',
+        title: proposal.title,
+        target: proposal.target.label,
+        changes: proposal.changes.map((c) => ({
+          field: c.field,
+          before: c.before,
+          after: c.after,
+        })),
+        expiresAt: proposal.expiresAt,
+        note: 'Nothing has been changed yet. The user must approve this proposal on the confirmation card.',
+      };
+      return { ok: true, data, summary: `Proposed: ${proposal.title}`, proposal };
+    } catch (err) {
+      if (!(err instanceof ProposalRejectedError)) throw err;
+      return {
+        ok: false,
+        data: { error: err.code, message: err.message, ...err.details },
+        summary: err.message,
+      };
+    }
   }
 
   private async getPipelineStats(ctx: ToolContext, ownedByMe: boolean): Promise<ToolOutcome> {

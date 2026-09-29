@@ -37,7 +37,7 @@ const AMOUNT = String.raw`\$?\s*(\d+(?:[.,]\d+)?)\s*(k|m|thousand|million)?\b`;
 const QTY = String.raw`(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)`;
 const UNIT = String.raw`(day|week|month)s?`;
 
-function toAmount(value: string, suffix: string | undefined): number {
+export function toAmount(value: string, suffix: string | undefined): number {
   const n = Number(value.replace(',', '.'));
   const multiplier =
     suffix === 'k' || suffix === 'thousand'

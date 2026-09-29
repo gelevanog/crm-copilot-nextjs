@@ -26,6 +26,7 @@ import {
 import { CurrentUser, type AuthUser } from '../common/auth-user';
 import { ZodValidationPipe } from '../common/zod-validation.pipe';
 import { AiService } from './ai.service';
+import { ConversationsService } from './conversations/conversations.service';
 import { AiRateLimitGuard } from './rate-limit/ai-rate-limit.guard';
 import { UsageService } from './usage/usage.service';
 
@@ -34,9 +35,14 @@ export class AiController {
   constructor(
     private readonly ai: AiService,
     private readonly usage: UsageService,
+    private readonly conversations: ConversationsService,
   ) {}
 
-  /** Streams newline-delimited JSON `ChatStreamEvent`s. */
+  /**
+   * Streams newline-delimited JSON `ChatStreamEvent`s. The conversation is
+   * resolved (or created) before the stream starts, so a foreign or unknown
+   * `conversationId` is a plain 404.
+   */
   @Post('chat')
   @UseGuards(AiRateLimitGuard)
   async chat(
@@ -44,6 +50,10 @@ export class AiController {
     @Body(new ZodValidationPipe(chatRequestSchema)) body: ChatRequest,
     @Res() res: Response,
   ): Promise<void> {
+    const conversation = body.conversationId
+      ? await this.conversations.get(user, body.conversationId)
+      : await this.conversations.create(user, body.message);
+
     res.status(200);
     res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -59,7 +69,7 @@ export class AiController {
       if (!res.writableEnded) res.write(`${JSON.stringify(event)}\n`);
     };
 
-    await this.ai.chat(user, body.messages, emit, abort.signal);
+    await this.ai.chat(user, conversation, body.message, emit, abort.signal);
     res.end();
   }
 

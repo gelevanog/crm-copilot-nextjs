@@ -84,6 +84,8 @@ export interface TurnResult {
   stopReason: StopReason;
   usage: TokenUsage;
   providerState?: unknown;
+  /** Model that actually answered, when it can differ from `model` (router fallbacks). */
+  servedModel?: string;
 }
 
 export interface StructuredRequest<T> {
@@ -99,10 +101,11 @@ export interface StructuredResult {
   /** Unvalidated JSON value; callers validate it against the Zod schema. */
   value: unknown;
   usage: TokenUsage;
+  servedModel?: string;
 }
 
 export interface LlmProvider {
-  readonly name: 'openai' | 'anthropic' | 'fake';
+  readonly name: 'openai' | 'openrouter' | 'anthropic' | 'fake';
   readonly model: string;
   /** One model turn: streams text deltas and returns any requested tool calls. */
   runTurn(request: TurnRequest): Promise<TurnResult>;
