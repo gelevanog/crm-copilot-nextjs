@@ -1,17 +1,18 @@
-import type { ChatMessage, ChatStreamEvent } from '@crm/shared';
+import type { ChatRequest, ChatStreamEvent } from '@crm/shared';
 
 /**
- * POSTs the conversation to the copilot endpoint (through the Next.js proxy)
- * and yields each NDJSON event as soon as it arrives.
+ * POSTs a question to the copilot endpoint (through the Next.js proxy) and
+ * yields each NDJSON event as soon as it arrives. The history lives on the
+ * server: only the conversation id and the new message are sent.
  */
 export async function* streamChat(
-  messages: ChatMessage[],
+  request: ChatRequest,
   signal: AbortSignal,
 ): AsyncGenerator<ChatStreamEvent> {
   const res = await fetch('/api/ai/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify(request),
     signal,
   });
 

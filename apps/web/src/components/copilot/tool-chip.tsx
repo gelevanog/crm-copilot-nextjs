@@ -1,10 +1,11 @@
 'use client';
 
-import type { ResultTable } from '@crm/shared';
+import type { ProposedActionView, ResultTable } from '@crm/shared';
 import { ChevronDown, Loader2, TriangleAlert, Wrench } from 'lucide-react';
 import Link from 'next/link';
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
+import { ProposalCard } from './proposal-card';
 
 export interface ToolActivity {
   id: string;
@@ -13,6 +14,7 @@ export interface ToolActivity {
   status: 'running' | 'ok' | 'error';
   summary?: string;
   table?: ResultTable;
+  proposal?: ProposedActionView;
 }
 
 /** `searchDeals(stages: NEGOTIATION, minAmount: 20000)` */
@@ -38,7 +40,12 @@ export function ToolChip({
   const hasTable = !!tool.table && tool.table.rows.length > 0;
 
   return (
-    <div className="bg-card rounded-lg border text-xs">
+    <div
+      className={cn(
+        'bg-card overflow-hidden rounded-lg border text-xs',
+        tool.proposal && 'border-ai-border',
+      )}
+    >
       <button
         type="button"
         onClick={() => hasTable && setOpen((o) => !o)}
@@ -68,6 +75,13 @@ export function ToolChip({
         )}
       </button>
       {open && tool.table && <ResultTableView table={tool.table} />}
+      {tool.proposal && (
+        // Keyed by status so fresher server state (e.g. a reopened conversation) resets the card.
+        <ProposalCard
+          key={`${tool.proposal.id}:${tool.proposal.status}`}
+          proposal={tool.proposal}
+        />
+      )}
     </div>
   );
 }

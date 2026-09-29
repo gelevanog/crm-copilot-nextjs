@@ -47,4 +47,4 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-export { proxy as GET, proxy as POST, proxy as PATCH };
+export { proxy as GET, proxy as POST, proxy as PATCH, proxy as DELETE };
