@@ -1,5 +1,7 @@
 # Zero-key demo:   docker compose up --build
 # Real models:     LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=... docker compose up --build
+# Free models:     LLM_PROVIDER=openrouter OPENROUTER_API_KEY=... docker compose up --build
+# Keys are read from your shell at runtime and never baked into the images.
 
 services:
   db:
@@ -34,8 +36,14 @@ services:
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3-super-120b-a12b:free}
+      OPENROUTER_FALLBACK_MODELS: ${OPENROUTER_FALLBACK_MODELS:-}
+      LLM_MIN_REQUEST_INTERVAL_MS: ${LLM_MIN_REQUEST_INTERVAL_MS:-0}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
       AI_RATE_LIMIT_CAPACITY: ${AI_RATE_LIMIT_CAPACITY:-20}
       AI_RATE_LIMIT_REFILL_PER_MINUTE: ${AI_RATE_LIMIT_REFILL_PER_MINUTE:-10}
+      AI_PROPOSAL_TTL_MINUTES: ${AI_PROPOSAL_TTL_MINUTES:-15}
     ports:
       - '${API_PORT:-4000}:4000'
     depends_on:
