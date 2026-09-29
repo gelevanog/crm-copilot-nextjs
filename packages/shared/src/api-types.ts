@@ -33,6 +33,8 @@ export interface DealListItem {
   stageChangedAt: string;
   daysInStage: number;
   expectedCloseDate: string | null;
+  /** Changes on every update; used for optimistic concurrency checks. */
+  updatedAt: string;
   company: CompanyRef;
   owner: UserRef;
 }
@@ -111,6 +113,8 @@ export const updateDealRequestSchema = z
     stage: z.enum(DEAL_STAGES).optional(),
     amount: z.number().int().nonnegative().optional(),
     expectedCloseDate: z.iso.date().nullable().optional(),
+    /** Must be a user of the same workspace (checked server-side). */
+    ownerId: z.string().min(1).optional(),
   })
   .strict()
   .refine((v) => Object.keys(v).length > 0, { message: 'Nothing to update' });

@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 import {
   DEAL_STAGES,
@@ -25,6 +30,14 @@ import {
 } from '../common/mappers';
 
 const DEFAULT_LIMIT = 50;
+
+export interface DealUpdateOptions {
+  /**
+   * Optimistic concurrency: apply the update only if the deal has not been
+   * modified since this instant (its `updatedAt`), otherwise 409.
+   */
+  ifUnmodifiedSince?: Date;
+}
 
 /**
  * Translates a validated DealFilter into a workspace-scoped Prisma where
@@ -106,24 +119,44 @@ export class DealsService {
     };
   }
 
-  async update(scope: TenantScope, id: string, body: UpdateDealRequest): Promise<DealDetail> {
+  async update(
+    scope: TenantScope,
+    id: string,
+    body: UpdateDealRequest,
+    opts: DealUpdateOptions = {},
+  ): Promise<DealDetail> {
     const existing = await this.prisma.deal.findFirst({
       where: { id, workspaceId: scope.workspaceId },
       select: { id: true, stage: true },
     });
     if (!existing) throw new NotFoundException('Deal not found');
 
+    if (body.ownerId !== undefined) {
+      const owner = await this.prisma.user.findFirst({
+        where: { id: body.ownerId, workspaceId: scope.workspaceId },
+        select: { id: true },
+      });
+      if (!owner) throw new BadRequestException('Unknown owner');
+    }
+
     const stageChanged = body.stage !== undefined && body.stage !== existing.stage;
-    await this.prisma.deal.update({
-      where: { id: existing.id },
+    // A conditional updateMany is an atomic compare-and-swap on `updatedAt`.
+    const { count } = await this.prisma.deal.updateMany({
+      where: {
+        id: existing.id,
+        workspaceId: scope.workspaceId,
+        ...(opts.ifUnmodifiedSince && { updatedAt: opts.ifUnmodifiedSince }),
+      },
       data: {
         ...(body.amount !== undefined && { amount: body.amount }),
         ...(body.expectedCloseDate !== undefined && {
           expectedCloseDate: body.expectedCloseDate ? new Date(body.expectedCloseDate) : null,
         }),
+        ...(body.ownerId !== undefined && { ownerId: body.ownerId }),
         ...(stageChanged && { stage: body.stage, stageChangedAt: new Date() }),
       },
     });
+    if (count === 0) throw new ConflictException('The deal was modified in the meantime');
     return this.findOne(scope, id);
   }
 

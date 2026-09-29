@@ -44,6 +44,7 @@ export function toDealListItem(deal: DealRow, now: Date = new Date()): DealListI
     stageChangedAt: deal.stageChangedAt.toISOString(),
     daysInStage: daysBetween(deal.stageChangedAt, now),
     expectedCloseDate: deal.expectedCloseDate?.toISOString() ?? null,
+    updatedAt: deal.updatedAt.toISOString(),
     company: deal.company,
     owner: deal.owner,
   };
