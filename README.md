@@ -566,6 +566,36 @@ async approve(scope: TenantScope, id: string): Promise<ProposedActionView> {
 - **OpenRouter**: the same OpenAI adapter pointed at `https://openrouter.ai/api/v1`, plus the `models` fallback list, attribution headers and the served-model report. Any other OpenAI-compatible endpoint works with `LLM_PROVIDER=openai` and `OPENAI_BASE_URL`.
 - **Fake**: keyword/regex router that emits the same tool calls a model would and writes templated answers from the tool results. It goes through exactly the same loop, validation and accounting code.
 
+## Adapting to your CRM
+
+The CRM in this repo is a stand-in. The copilot is built to sit on top of whatever system already holds the data: HubSpot, Salesforce, Pipedrive, amoCRM, Bitrix24 or an in-house CRM. It is not a drop-in plugin, but the part that has to change per CRM is small and clearly bounded.
+
+**What carries over unchanged.** The whole `ai/` module: the tool-calling loop, provider adapters (OpenAI, Claude, OpenRouter), Zod tool schemas, streaming, saved conversations, the propose/approve flow, structured outputs, rate limiting and usage accounting. Its own tables (`Conversation`, `ConversationMessage`, `ProposedAction`, `AiUsage`) belong to the AI layer and can live in a small Postgres database next to any CRM.
+
+**The seam.** The AI module never queries CRM data directly. Every read and write goes through eight service methods, always called with the caller's `TenantScope`:
+
+| Used by                      | Method                                       | What an adapter does instead                            |
+| ---------------------------- | -------------------------------------------- | ------------------------------------------------------- |
+| `searchDeals`, NL filters    | `deals.search(scope, filter)`                | Translate the `DealFilter` into the CRM's search API    |
+| proposals, staleness check   | `deals.findOne(scope, id)`                   | Fetch one deal, including its last-modified timestamp   |
+| approved stage/field changes | `deals.update(scope, id, patch)`             | Update through the CRM API as the approving user        |
+| `getPipelineStats`           | `deals.pipelineStats(scope)`                 | Use the CRM's reporting API or aggregate search results |
+| `getCompany`                 | `companies.findByName` / `companies.findOne` | Look up the account/organization object                 |
+| `listActivities`             | `activities.list(scope, filter)`             | Read notes, calls, emails and tasks (engagements)       |
+| approved `proposeActivity`   | `activities.create(scope, input)`            | Create a note or task on the record                     |
+
+Replace those services with an adapter for the target CRM (HubSpot CRM objects and search API, Salesforce REST with SOQL, Pipedrive REST, amoCRM API v4, Bitrix24 `crm.*` methods, or a client's own backend) and the copilot works against it. The tools, prompts and UI don't need to know which CRM is behind them.
+
+**What needs real work per CRM:**
+
+1. **Identity and permissions.** Here `TenantScope` comes from the app's own JWT. In a real CRM it carries the user's OAuth token, and the adapter calls the API as that user, so the CRM's own sharing rules decide what the copilot can see and change. Nothing is fetched with an admin token and filtered afterwards.
+2. **Data model mapping.** Pipelines and stage ids, owners, currencies and custom fields differ between CRMs. They are mapped once in the adapter. Fields the model should be able to filter on are added to the shared `DealFilter` schema and described in `ai/prompts/templates.ts`.
+3. **Staleness.** Approval is a compare-and-swap on the record's modified timestamp. The adapter maps it to the CRM's equivalent (for example `hs_lastmodifieddate` in HubSpot or `LastModifiedDate` in Salesforce). If the CRM supports conditional updates, the check can move into the API call itself.
+4. **Embedding the UI.** The chat drawer is a self-contained component that talks to the API over one streaming endpoint. It can be mounted through the CRM's extension mechanism (HubSpot UI extensions, Salesforce Lightning components, Pipedrive app extensions, amoCRM or Bitrix24 widgets) or shipped as a browser extension when the CRM has none.
+5. **Limits and webhooks.** Respect the CRM's API rate limits (cache reference data such as pipelines and owners), and optionally subscribe to webhooks to invalidate pending proposals as soon as a record changes.
+
+**Typical effort.** For a CRM with a good REST API and 4–6 tools like the ones here, an adapter plus OAuth and UI embedding is roughly one to two weeks. Heavily customized objects or complex permission models add to that. The AI layer itself is reused as is.
+
 ## Configuration
 
 All API variables are validated in `apps/api/src/config/env.ts`; see `.env.example` for comments.
