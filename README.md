@@ -154,7 +154,7 @@ sequenceDiagram
   A->>M: runTurn(... + assistant tool calls + all tool results)
   M-->>A: final answer (streamed)
   A-->>U: {"type":"text", delta} ... {"type":"done", usage}
-  A->>DB: save tool calls, results and answer; insert AiUsage
+  A->>DB: save tool calls, results and answer, insert AiUsage
 ```
 
 Write actions add a second, separate step that only the user can trigger:
